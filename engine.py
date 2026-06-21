@@ -27,6 +27,11 @@ TREASURY_SECRET = os.getenv("TREASURY_SECRET", "").strip()
 VAULTIE_MINT    = os.getenv("VAULTIE_MINT", "").strip()
 ENGINE_ENABLED  = os.getenv("ENGINE_ENABLED", "1") != "0"
 
+# ---- safety rails (0 = no cap) ----
+MAX_LOAN_SOL        = float(os.getenv("MAX_LOAN_SOL", "0"))         # hard cap per single payout
+MAX_OUTSTANDING_SOL = float(os.getenv("MAX_OUTSTANDING_SOL", "0"))  # cap on total live credit
+MANUAL_APPROVAL     = os.getenv("MANUAL_APPROVAL", "0") == "1"      # require operator OK before payout
+
 LAMPORTS = 1_000_000_000
 WSOL     = "So11111111111111111111111111111111111111112"
 JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
@@ -192,4 +197,6 @@ def status() -> dict:
         "ready": ENGINE.ready, "dryRun": ENGINE.dry, "enabled": ENGINE_ENABLED,
         "reason": ENGINE.reason, "vaultieMint": bool(VAULTIE_MINT),
         "treasury": (str(ENGINE.treasury.pubkey()) if ENGINE.treasury else None),
+        "maxLoanSol": MAX_LOAN_SOL, "maxOutstandingSol": MAX_OUTSTANDING_SOL,
+        "manualApproval": MANUAL_APPROVAL,
     }

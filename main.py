@@ -40,12 +40,14 @@ ORIGINS      = os.getenv("CORS_ORIGINS", "*").split(",")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE = DATA_DIR / "vaultie.json"
 
-# ---- seed token registry (replace addresses/liquidity with a live source) ----
+# ---- curated watchlist (addresses only; all data pulled live from Dexscreener) ----
 SEED_TOKENS = [
-    {"symbol": "WIF", "name": "dogwifhat", "address": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "liquiditySol": 9200, "priceUsd": 0.0204, "change24h": 6.1},
-    {"symbol": "POPCAT", "name": "Popcat", "address": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr", "liquiditySol": 6400, "priceUsd": 0.51, "change24h": -3.4},
-    {"symbol": "PNUT", "name": "Peanut", "address": "2qEHjDLDLbuBgRYvsxhc5NEU7g3p6vNJ7NXG7vN9zcjm", "liquiditySol": 3100, "priceUsd": 0.142, "change24h": 11.7},
-    {"symbol": "GIGA", "name": "Gigachad", "address": "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9", "liquiditySol": 2700, "priceUsd": 0.031, "change24h": 2.8},
+    {"address": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"},  # WIF
+    {"address": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"},  # POPCAT
+    {"address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"},  # BONK
+    {"address": "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5"},   # MEW
+    {"address": "5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC"},   # FARTCOIN
+    {"address": "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9"},  # GIGA
 ]
 
 
@@ -135,12 +137,8 @@ def fetch_token(address: str) -> Optional[dict]:
 
 
 def get_token(address: str) -> Optional[dict]:
-    """Live first, seed fallback by address, else None."""
-    live = fetch_token(address)
-    if live:
-        return live
-    seed = next((t for t in SEED_TOKENS if t["address"] == address), None)
-    return _seed_enrich(seed) if seed else None
+    """Live data only. Returns None if the token has no resolvable Solana market."""
+    return fetch_token(address)
 
 
 def appraise(token, amount, boost):
@@ -188,24 +186,38 @@ class StakeIn(BaseModel):
 @app.get("/api/protocol/stats")
 def stats():
     db = _load()
-    active = [l for l in db["loans"] if l["status"] == "active"]
-    outstanding = sum(l["repaySol"] for l in active)
-    liquidity = sum(x["amount"] for x in db["lp"]) or 14820.0
+    loans = db["loans"]
+    active = [l for l in loans if l["status"] == "active"]
+    repaid = [l for l in loans if l["status"] == "repaid"]
+    liquidated = [l for l in loans if l["status"] == "liquidated"]
+    funded = [l for l in loans if l.get("disburseSig") or l["status"] in ("active", "repaid", "liquidated")]
+    outstanding = sum(l.get("creditSol", 0) for l in active)
+    borrowed_all = sum(l.get("creditSol", 0) for l in funded)
+    revenue = sum(l.get("interestSol", 0) for l in repaid)
+    liquidity = sum(x["amount"] for x in db["lp"])
     util = min(outstanding / liquidity, 0.95) if liquidity else 0
+    wallets = {l.get("fromWallet") or l.get("recipient") for l in loans}
+    wallets.discard(None)
     return {
         "liquiditySol": round(liquidity, 2),
         "creditOutstandingSol": round(outstanding, 2),
+        "borrowedAllTimeSol": round(borrowed_all, 3),
+        "revenueSol": round(revenue, 4),
         "activeLiens": len(active),
-        "lpApr": round(0.08 + util * 0.40, 4),  # dynamic: base + utilization
+        "loansFunded": len(funded),
+        "loansRepaid": len(repaid),
+        "liquidations": len(liquidated),
+        "tokensCount": len({l["tokenAddress"] for l in funded}),
+        "users": len(wallets),
+        "utilization": round(util, 4),
+        "lpApr": round(util * 0.40, 4),     # 0 at launch; rises with real utilization
     }
 
 @app.get("/api/tokens")
 def tokens():
-    """Curated watchlist, enriched live where possible."""
-    out = []
-    for s in SEED_TOKENS:
-        out.append(fetch_token(s["address"]) or _seed_enrich(s))
-    return {"tokens": out}
+    """Curated watchlist, live only — tokens that don't resolve are omitted (no fake data)."""
+    out = [fetch_token(s["address"]) for s in SEED_TOKENS]
+    return {"tokens": [t for t in out if t]}
 
 @app.get("/api/tokens/lookup")
 def lookup(address: str = Query(...)):
@@ -323,8 +335,9 @@ def _disburse_ready_loans():
     if not (engine.ENGINE_ENABLED and engine.ENGINE.ready):
         return
     db = _load(); changed = False
+    outstanding = sum(l.get("creditSol", 0) for l in db["loans"] if l["status"] == "active")
     for l in db["loans"]:
-        if l["status"] != "awaiting_deposit" or l.get("disburseSig"):
+        if l["status"] not in ("awaiting_deposit", "pending_approval") or l.get("disburseSig"):
             continue
         wallet = l.get("fromWallet")
         if not wallet:
@@ -339,6 +352,22 @@ def _disburse_ready_loans():
         boost = engine.ENGINE.vaultie_balance(wallet) >= BOOST_MIN
         ltv = LTV_BOOST if boost else LTV
         credit = round(l["amount"] * price * ltv, 6)
+
+        # ---- safety rails ----
+        if engine.MAX_LOAN_SOL and credit > engine.MAX_LOAN_SOL:
+            if l.get("held") != "MAX_LOAN_SOL":
+                l.update(status="held", held="MAX_LOAN_SOL", quotedCreditSol=credit); changed = True
+            continue
+        if engine.MAX_OUTSTANDING_SOL and (outstanding + credit) > engine.MAX_OUTSTANDING_SOL:
+            if l.get("held") != "MAX_OUTSTANDING_SOL":
+                l.update(status="held", held="MAX_OUTSTANDING_SOL", quotedCreditSol=credit); changed = True
+            continue
+        if engine.MANUAL_APPROVAL and not l.get("approved"):
+            if l["status"] != "pending_approval":
+                l.update(status="pending_approval", quotedCreditSol=credit,
+                         depositConfirmedBalance=bal); changed = True
+            continue
+
         if not engine.ENGINE.dry:               # treasury guard
             tre = str(engine.ENGINE.treasury.pubkey())
             if engine.ENGINE.sol_balance(tre) < credit + 0.01:
@@ -351,7 +380,8 @@ def _disburse_ready_loans():
                  interestSol=round(credit * INTEREST, 6),
                  repaySol=round(credit * (1 + INTEREST), 6),
                  liqPriceSol=price * (1 - LIQ_DROP), entryPriceSol=price,
-                 boost=boost, disbursedAt=time.time())
+                 boost=boost, disbursedAt=time.time(), held=None)
+        outstanding += credit
         changed = True
     if changed:
         _save(db)
@@ -403,6 +433,21 @@ def _start_engine():
 @app.get("/api/engine/status")
 def engine_status():
     return engine.status()
+
+
+@app.post("/api/loans/{loan_id}/approve")
+def approve_loan(loan_id: str):
+    """Operator approval for MANUAL_APPROVAL mode: release a held/pending payout."""
+    db = _load()
+    loan = next((l for l in db["loans"] if l["id"] == loan_id), None)
+    if not loan:
+        raise HTTPException(404, "loan not found")
+    loan["approved"] = True
+    if loan["status"] in ("pending_approval", "held"):
+        loan["status"] = "awaiting_deposit"      # next engine pass will pay it
+        loan["held"] = None
+    _save(db)
+    return {"id": loan_id, "approved": True, "status": loan["status"]}
 
 @app.post("/api/staking/sol")
 def stake_sol(body: StakeIn):

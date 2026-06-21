@@ -32,3 +32,22 @@ every payout / release / liquidation is logged and skipped — nothing leaves a 
   protect the treasury, not the token's market price.
 * `GET /api/engine/status` shows `{ready, dryRun, reason, treasury}` so you can confirm
   the engine is armed correctly without exposing the key.
+
+## Safety rails (for a careful mainnet launch)
+Set these so an untested bug can't drain the treasury. `0` = no cap.
+
+| Var | Effect | Suggested first launch |
+|-----|--------|------------------------|
+| `MAX_LOAN_SOL` | Hard cap per single payout. Bigger quotes are **held**, not paid. | `0.1` |
+| `MAX_OUTSTANDING_SOL` | Cap on total live credit across all loans. | `2` |
+| `MANUAL_APPROVAL` | `1` = watcher detects the deposit but **waits for you** before paying. | `1` (first loans) |
+
+Held / pending loans surface with `status: "held"` or `"pending_approval"`.
+Release one with: `POST /api/loans/{id}/approve` → it pays on the next pass.
+
+### Recommended "mainnet canary" first launch
+1. New treasury wallet, fund with **0.3–0.5 SOL only**.
+2. Variables: `RPC_URL`, `TREASURY_SECRET`, `MAX_LOAN_SOL=0.1`, `MAX_OUTSTANDING_SOL=2`, `MANUAL_APPROVAL=1`.
+3. Do one loan yourself with a cheap bonded token; approve it; verify payout, repay, release, then force a liquidation.
+4. Only then raise the caps / drop MANUAL_APPROVAL and fund the treasury for real.
+With a small treasury + `MAX_LOAN_SOL`, the worst-case loss from a bug is bounded.

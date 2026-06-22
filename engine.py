@@ -30,6 +30,8 @@ ENGINE_ENABLED  = os.getenv("ENGINE_ENABLED", "1") != "0"
 # ---- safety rails (0 = no cap) ----
 MAX_LOAN_SOL        = float(os.getenv("MAX_LOAN_SOL", "0"))         # hard cap per single payout
 MAX_OUTSTANDING_SOL = float(os.getenv("MAX_OUTSTANDING_SOL", "0"))  # cap on total live credit
+MAX_PER_WALLET_SOL  = float(os.getenv("MAX_PER_WALLET_SOL", "0"))   # cap on one wallet's total live credit
+LOCK_GAS_SOL        = float(os.getenv("LOCK_GAS_SOL", "0.01"))      # SOL sent to each lock address to fund release/liquidation fees
 MANUAL_APPROVAL     = os.getenv("MANUAL_APPROVAL", "0") == "1"      # require operator OK before payout
 
 LAMPORTS = 1_000_000_000
@@ -216,5 +218,6 @@ def status() -> dict:
         "reason": ENGINE.reason, "vaultieMint": bool(VAULTIE_MINT),
         "treasury": (str(ENGINE.treasury.pubkey()) if ENGINE.treasury else None),
         "maxLoanSol": MAX_LOAN_SOL, "maxOutstandingSol": MAX_OUTSTANDING_SOL,
+        "maxPerWalletSol": MAX_PER_WALLET_SOL,
         "manualApproval": MANUAL_APPROVAL,
     }

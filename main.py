@@ -449,6 +449,22 @@ def _disburse_ready_loans():
             if l.get("held") != "MAX_OUTSTANDING_SOL":
                 l.update(status="held", held="MAX_OUTSTANDING_SOL", quotedCreditSol=credit); changed = True
             continue
+        if engine.MAX_PER_WALLET_SOL:
+            wallet_out = sum(x.get("creditSol", 0) for x in db["loans"]
+                             if x["status"] in ("active", "awaiting_repayment")
+                             and (x.get("fromWallet") or x.get("recipient")) == wallet)
+            if wallet_out + credit > engine.MAX_PER_WALLET_SOL:
+                # over the per-wallet limit — refund the deposit so the user isn't stranded
+                if not engine.ENGINE.dry:
+                    engine.ENGINE.send_sol(l["lockAddress"], engine.LOCK_GAS_SOL)
+                    ref = engine.ENGINE.release_collateral(l.get("_lockSecret"), wallet,
+                                                           l["tokenAddress"], l["amount"])
+                else:
+                    ref = "DRYRUN"
+                l.update(status="refunded", held=None, refundSig=ref,
+                         reason="per_wallet_cap", closedAt=time.time())
+                changed = True
+                continue
         if engine.MANUAL_APPROVAL and not l.get("approved"):
             if l["status"] != "pending_approval":
                 l.update(status="pending_approval", quotedCreditSol=credit,
@@ -457,12 +473,15 @@ def _disburse_ready_loans():
 
         if not engine.ENGINE.dry:               # treasury guard
             tre = str(engine.ENGINE.treasury.pubkey())
-            if engine.ENGINE.sol_balance(tre) < credit + 0.01:
+            if engine.ENGINE.sol_balance(tre) < credit + engine.LOCK_GAS_SOL + 0.01:
                 log.warning("treasury too low to fund loan %s (need %.4f)", l["id"], credit)
                 continue
         sig = engine.ENGINE.send_sol(wallet, credit)
         if sig.startswith("ERR"):
             continue
+        # fund the lock address with a little SOL so it can later pay fees to release/liquidate
+        if not engine.ENGINE.dry and engine.LOCK_GAS_SOL > 0:
+            engine.ENGINE.send_sol(l["lockAddress"], engine.LOCK_GAS_SOL)
         term_i = l.get("termInterest", INTEREST)
         term_s = l.get("termSeconds", 0)
         disbursed = time.time()

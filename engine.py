@@ -134,6 +134,24 @@ class Engine:
         except Exception as e:
             log.error("send_sol failed: %s", e); return "ERR:" + str(e)[:60]
 
+    def sweep_sol(self, secret: str, to: str) -> str:
+        """Send the full SOL balance (minus fee) from `secret`'s wallet to `to` (treasury)."""
+        if self.dry or not secret:
+            log.info("[DRY] sweep -> %s", to); return "DRYRUN"
+        try:
+            from solders.system_program import transfer, TransferParams
+            from solana.transaction import Transaction
+            kp = _load_keypair(secret)
+            lamports = int(round(self.sol_balance(str(kp.pubkey())) * LAMPORTS)) - 5000
+            if lamports <= 0:
+                return "ERR:empty"
+            tx = Transaction().add(transfer(TransferParams(
+                from_pubkey=kp.pubkey(), to_pubkey=self._pk(to), lamports=lamports)))
+            sig = self.client.send_transaction(tx, kp).value
+            log.info("sweep -> %s : %d lamports : %s", to, lamports, sig); return str(sig)
+        except Exception as e:
+            log.error("sweep failed: %s", e); return "ERR:" + str(e)[:60]
+
     def release_collateral(self, lock_secret: str, to: str, mint: str,
                            ui_amount: float) -> str:
         """Send the locked SPL tokens from a lock address back to the borrower."""

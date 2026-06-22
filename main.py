@@ -30,10 +30,45 @@ from pydantic import BaseModel
 LTV          = float(os.getenv("LTV", "0.10"))
 LTV_BOOST    = float(os.getenv("LTV_BOOST", "0.15"))
 INTEREST     = float(os.getenv("INTEREST", "0.05"))
+
+# ---- loan terms: shorter = cheaper, longer = pricier. key:seconds:interest ----
+def _parse_terms(raw):
+    out = []
+    labels = {"2h": "2 hours", "1d": "1 day", "1w": "1 week", "1mo": "1 month"}
+    for part in raw.split(","):
+        b = part.split(":")
+        if len(b) == 3:
+            out.append({"key": b[0], "label": labels.get(b[0], b[0]),
+                        "seconds": int(b[1]), "interest": float(b[2])})
+    return out
+LOAN_TERMS = _parse_terms(os.getenv("LOAN_TERMS", "2h:7200:0.02,1d:86400:0.04,1w:604800:0.07,1mo:2592000:0.12"))
+DEFAULT_TERM = os.getenv("DEFAULT_TERM", "1w")
+
+def term_for(key):
+    for t in LOAN_TERMS:
+        if t["key"] == key:
+            return t
+    for t in LOAN_TERMS:
+        if t["key"] == DEFAULT_TERM:
+            return t
+    return LOAN_TERMS[0] if LOAN_TERMS else {"key": "1w", "label": "1 week", "seconds": 604800, "interest": INTEREST}
 LIQ_DROP     = float(os.getenv("LIQ_DROP", "0.50"))
 CAP          = float(os.getenv("SMART_CAP", "0.10"))
 BOOST_MIN    = int(os.getenv("BOOST_MIN", "10000000"))
 SOL_USD      = float(os.getenv("SOL_USD", "165"))          # fallback only; live pairs derive SOL price from Dexscreener
+
+# ---- $VAULTIE stake → LTV tiers (+5% steps) + repayment reputation ----
+def _parse_tiers(raw):
+    out = []
+    for part in raw.split(","):
+        if ":" in part:
+            thr, val = part.split(":"); out.append((float(thr), float(val)))
+    return sorted(out)
+# threshold($VAULTIE held) : LTV  — default steps of +5%
+LTV_TIERS   = _parse_tiers(os.getenv("LTV_TIERS", "10000000:0.15,50000000:0.20,100000000:0.25"))
+LTV_MAX     = float(os.getenv("LTV_MAX", "0.25"))       # hard ceiling on effective LTV
+REP_PER_SOL = float(os.getenv("REP_PER_SOL", "0.002"))  # +LTV per 1 SOL of repaid credit
+REP_MAX     = float(os.getenv("REP_MAX", "0.05"))       # cap on the reputation bonus
 DATA_DIR     = Path(os.getenv("DATA_DIR", "./data"))
 ORIGINS      = os.getenv("CORS_ORIGINS", "*").split(",")
 
@@ -86,13 +121,6 @@ _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = float(os.getenv("PRICE_TTL", "30"))
 
 
-def _seed_enrich(t: dict) -> dict:
-    """Give a seed token the same shape as a live one (uses fallback SOL_USD)."""
-    price_sol = t["priceUsd"] / SOL_USD
-    return {**t, "priceSol": price_sol, "liquidityUsd": t["liquiditySol"] * SOL_USD,
-            "solUsd": SOL_USD, "live": False}
-
-
 def _parse_dex(payload: dict, address: str) -> Optional[dict]:
     pairs = [p for p in (payload.get("pairs") or []) if p.get("chainId") == "solana"]
     if not pairs:
@@ -141,19 +169,45 @@ def get_token(address: str) -> Optional[dict]:
     return fetch_token(address)
 
 
-def appraise(token, amount, boost):
+def stake_ltv(vaultie_balance: float) -> float:
+    """LTV from $VAULTIE held: walks the tiers, highest matched wins."""
+    ltv = LTV
+    for thr, val in LTV_TIERS:
+        if vaultie_balance >= thr:
+            ltv = val
+    return ltv
+
+def repaid_volume(db, wallet: str) -> float:
+    """Total SOL credit this wallet has successfully repaid (reputation basis)."""
+    if not wallet:
+        return 0.0
+    return sum(l.get("creditSol", 0) for l in db["loans"]
+               if l["status"] == "repaid" and (l.get("fromWallet") or l.get("recipient")) == wallet)
+
+def reputation_bonus(vol_sol: float) -> float:
+    return min(REP_MAX, vol_sol * REP_PER_SOL)
+
+def effective_ltv(vaultie_balance: float, repaid_vol: float) -> float:
+    """Base + stake tier + reputation, capped at LTV_MAX."""
+    return round(min(LTV_MAX, stake_ltv(vaultie_balance) + reputation_bonus(repaid_vol)), 6)
+
+
+def appraise(token, amount, boost, interest=None):
     """Appraise against the live spot price. Works in SOL directly via priceSol."""
+    if interest is None:
+        interest = INTEREST
     ltv = LTV_BOOST if boost else LTV
     value_usd = amount * token["priceUsd"]
     value_sol = amount * token["priceSol"]
     credit_sol = value_sol * ltv
-    interest_sol = credit_sol * INTEREST
+    interest_sol = credit_sol * interest
     liq_price_sol = token["priceSol"] * (1 - LIQ_DROP)     # -50% from entry
     cap_credit_sol = token["liquiditySol"] * CAP * ltv      # Smart Cap drawable
     return {
         "appraisedUsd": round(value_usd, 2),
         "appraisedSol": round(value_sol, 4),
         "ltv": ltv,
+        "interest": interest,
         "creditSol": round(credit_sol, 6),
         "interestSol": round(interest_sol, 6),
         "repaySol": round(credit_sol + interest_sol, 6),
@@ -169,6 +223,7 @@ class QuoteIn(BaseModel):
     tokenAddress: str
     amount: float
     boost: bool = False
+    term: Optional[str] = None        # term key: 2h / 1d / 1w / 1mo
 
 class LoanIn(QuoteIn):
     symbol: Optional[str] = None
@@ -189,8 +244,8 @@ def stats():
     loans = db["loans"]
     active = [l for l in loans if l["status"] == "active"]
     repaid = [l for l in loans if l["status"] == "repaid"]
-    liquidated = [l for l in loans if l["status"] == "liquidated"]
-    funded = [l for l in loans if l.get("disburseSig") or l["status"] in ("active", "repaid", "liquidated")]
+    liquidated = [l for l in loans if l["status"] in ("liquidated", "defaulted")]
+    funded = [l for l in loans if l.get("disburseSig") or l["status"] in ("active", "repaid", "liquidated", "defaulted")]
     outstanding = sum(l.get("creditSol", 0) for l in active)
     borrowed_all = sum(l.get("creditSol", 0) for l in funded)
     revenue = sum(l.get("interestSol", 0) for l in repaid)
@@ -228,22 +283,32 @@ def lookup(address: str = Query(...)):
         raise HTTPException(404, "No Solana market found for this token")
     return t
 
+@app.get("/api/terms")
+def terms():
+    """Available loan terms. Shorter term = lower interest."""
+    return {"terms": LOAN_TERMS, "default": DEFAULT_TERM}
+
 @app.post("/api/loans/quote")
 def quote(q: QuoteIn):
     t = get_token(q.tokenAddress)
     if not t:
         raise HTTPException(404, "No Solana market found for this token")
-    return appraise(t, q.amount, q.boost)
+    term = term_for(q.term)
+    a = appraise(t, q.amount, q.boost, term["interest"])
+    a["term"] = term
+    return a
 
 @app.post("/api/loans")
 def open_loan(body: LoanIn):
     t = get_token(body.tokenAddress)
     if not t:
         raise HTTPException(404, "No Solana market found for this token")
-    a = appraise(t, body.amount, body.boost)
+    term = term_for(body.term)
+    a = appraise(t, body.amount, body.boost, term["interest"])
     if a["overCap"]:
         raise HTTPException(400, f"Exceeds Smart Cap — max credit {a['maxCreditSol']} SOL for this token")
     lock = new_lock_address()
+    repay_addr = new_lock_address()
     now = time.time()
     loan = {
         "id": uuid.uuid4().hex[:12],
@@ -254,16 +319,23 @@ def open_loan(body: LoanIn):
         "recipient": body.recipient,   # may be None — credit returns to sender
         "fromWallet": None,
         "lockAddress": lock["address"],
+        "repayAddress": repay_addr["address"],
         "entryPriceSol": t["priceSol"],
         "liqPriceSol": a["liqPriceSol"],
         "creditSol": a["creditSol"],
         "interestSol": a["interestSol"],
         "repaySol": a["repaySol"],
-        "status": "pending_deposit",  # -> active after deposit confirmed -> repaid|liquidated
+        "termKey": term["key"],
+        "termLabel": term["label"],
+        "termSeconds": term["seconds"],
+        "termInterest": term["interest"],
+        "dueAt": None,                # set at disbursement
+        "status": "pending_deposit",  # -> active after deposit confirmed -> repaid|liquidated|defaulted
         "openedAt": now,
     }
     db = _load()
-    db["loans"].append({**loan, "_lockSecret": lock.get("secret")})
+    db["loans"].append({**loan, "_lockSecret": lock.get("secret"),
+                        "_repaySecret": repay_addr.get("secret")})
     _save(db)
     loan.pop("_lockSecret", None)
     return loan
@@ -289,6 +361,8 @@ def list_loans(recipient: str = Query(...)):
             "id": l["id"], "symbol": l["symbol"], "amount": l["amount"],
             "creditSol": l["creditSol"], "repaySol": l["repaySol"],
             "liqPriceSol": liq, "health": health, "status": l["status"],
+            "repayAddress": l.get("repayAddress"),
+            "termLabel": l.get("termLabel"), "dueAt": l.get("dueAt"),
         })
     return {"loans": out}
 
@@ -315,9 +389,21 @@ def repay(loan_id: str):
     loan = next((l for l in db["loans"] if l["id"] == loan_id), None)
     if not loan:
         raise HTTPException(404, "Lien not found")
-    if loan["status"] in ("repaid", "liquidated"):
+    if loan["status"] in ("repaid", "liquidated", "defaulted"):
         raise HTTPException(400, f"Lien already {loan['status']}")
-    # MVP: mark repaid. Real flow verifies inbound SOL = repaySol, then releases collateral.
+    # ---- live engine: collateral is released only after the repay SOL is received ----
+    if engine.ENGINE_ENABLED and engine.ENGINE.ready and not engine.ENGINE.dry:
+        if loan["status"] not in ("active", "awaiting_repayment"):
+            raise HTTPException(400, "Loan is not active")
+        loan["status"] = "awaiting_repayment"
+        loan["repayRequestedAt"] = time.time()
+        _save(db)
+        return {"id": loan_id, "status": "awaiting_repayment",
+                "repayAddress": loan.get("repayAddress"),
+                "repaySol": loan.get("repaySol"), "symbol": loan["symbol"],
+                "note": "Send exactly this much SOL to repayAddress from your wallet. "
+                        "Your collateral is released automatically once it arrives."}
+    # ---- dry-run / simulation: no real funds move, mark repaid immediately ----
     loan["status"] = "repaid"
     loan["closedAt"] = time.time()
     borrower = loan.get("fromWallet") or loan.get("recipient")
@@ -349,8 +435,9 @@ def _disburse_ready_loans():
         price = t["priceSol"] if t else l.get("entryPriceSol", 0)
         if not price:
             continue
-        boost = engine.ENGINE.vaultie_balance(wallet) >= BOOST_MIN
-        ltv = LTV_BOOST if boost else LTV
+        vb = engine.ENGINE.vaultie_balance(wallet)
+        rep = repaid_volume(db, wallet)
+        ltv = effective_ltv(vb, rep)
         credit = round(l["amount"] * price * ltv, 6)
 
         # ---- safety rails ----
@@ -376,11 +463,15 @@ def _disburse_ready_loans():
         sig = engine.ENGINE.send_sol(wallet, credit)
         if sig.startswith("ERR"):
             continue
+        term_i = l.get("termInterest", INTEREST)
+        term_s = l.get("termSeconds", 0)
+        disbursed = time.time()
         l.update(status="active", disburseSig=sig, creditSol=credit,
-                 interestSol=round(credit * INTEREST, 6),
-                 repaySol=round(credit * (1 + INTEREST), 6),
+                 interestSol=round(credit * term_i, 6),
+                 repaySol=round(credit * (1 + term_i), 6),
                  liqPriceSol=price * (1 - LIQ_DROP), entryPriceSol=price,
-                 boost=boost, disbursedAt=time.time(), held=None)
+                 ltvApplied=ltv, boost=(ltv > LTV), disbursedAt=disbursed,
+                 dueAt=(disbursed + term_s if term_s else None), held=None)
         outstanding += credit
         changed = True
     if changed:
@@ -392,8 +483,21 @@ def _check_liquidations():
     if not (engine.ENGINE_ENABLED and engine.ENGINE.ready):
         return
     db = _load(); changed = False
+    now = time.time()
     for l in db["loans"]:
-        if l["status"] != "active" or l.get("liqSig"):
+        if l["status"] not in ("active", "awaiting_repayment") or l.get("liqSig"):
+            continue
+        # ---- term expired → borrower defaulted → collateral forfeited to protocol ----
+        # (also applies while awaiting repayment, so the term can't be dodged)
+        if l.get("dueAt") and now > l["dueAt"]:
+            sig = engine.ENGINE.liquidate_swap(l.get("_lockSecret"), l["tokenAddress"], l["amount"])
+            if sig.startswith("ERR"):
+                continue
+            l.update(status="defaulted", liqSig=sig, closedAt=now,
+                     defaultReason="term_expired")
+            changed = True
+            continue
+        if l["status"] != "active":
             continue
         t = get_token(l["tokenAddress"])
         if not t:
@@ -402,9 +506,37 @@ def _check_liquidations():
             sig = engine.ENGINE.liquidate_swap(l.get("_lockSecret"), l["tokenAddress"], l["amount"])
             if sig.startswith("ERR"):
                 continue
-            l.update(status="liquidated", liqSig=sig, closedAt=time.time(),
+            l.update(status="liquidated", liqSig=sig, closedAt=now,
                      liqPriceObserved=t["priceSol"])
             changed = True
+    if changed:
+        _save(db)
+
+
+def _check_repayments():
+    """Release collateral once the borrower's repay SOL lands on the loan's repay address."""
+    if not (engine.ENGINE_ENABLED and engine.ENGINE.ready) or engine.ENGINE.dry:
+        return
+    db = _load(); changed = False
+    tre = str(engine.ENGINE.treasury.pubkey())
+    for l in db["loans"]:
+        if l["status"] != "awaiting_repayment" or l.get("releaseSig"):
+            continue
+        addr = l.get("repayAddress"); need = l.get("repaySol") or 0
+        if not addr or need <= 0:
+            continue
+        if engine.ENGINE.sol_balance(addr) < need * 0.999:   # not paid yet
+            continue
+        borrower = l.get("fromWallet") or l.get("recipient")
+        if not borrower:
+            continue
+        rel = engine.ENGINE.release_collateral(l.get("_lockSecret"), borrower, l["tokenAddress"], l["amount"])
+        if rel.startswith("ERR"):
+            continue
+        swp = engine.ENGINE.sweep_sol(l.get("_repaySecret"), tre)   # move repayment into treasury
+        l.update(status="repaid", releaseSig=rel, sweepSig=swp,
+                 closedAt=time.time(), repaidAt=time.time())
+        changed = True
     if changed:
         _save(db)
 
@@ -415,6 +547,7 @@ def _engine_loop():
     while True:
         try:
             _disburse_ready_loans()
+            _check_repayments()
             _check_liquidations()
         except Exception as e:
             log.warning("engine loop error: %s", e)
@@ -433,6 +566,25 @@ def _start_engine():
 @app.get("/api/engine/status")
 def engine_status():
     return engine.status()
+
+
+@app.get("/api/account/{wallet}")
+def account(wallet: str):
+    """A wallet's borrowing power: $VAULTIE tier + repayment reputation → effective LTV."""
+    db = _load()
+    vb = engine.ENGINE.vaultie_balance(wallet) if engine.ENGINE.ready else 0.0
+    rep_vol = repaid_volume(db, wallet)
+    return {
+        "wallet": wallet,
+        "vaultieBalance": vb,
+        "repaidVolumeSol": round(rep_vol, 3),
+        "baseLtv": LTV,
+        "stakeLtv": stake_ltv(vb),
+        "reputationBonus": round(reputation_bonus(rep_vol), 4),
+        "effectiveLtv": effective_ltv(vb, rep_vol),
+        "ltvMax": LTV_MAX,
+        "tiers": [{"min": t, "ltv": v} for t, v in LTV_TIERS],
+    }
 
 
 @app.post("/api/loans/{loan_id}/approve")

@@ -96,6 +96,23 @@ def _save(db):
     DB_FILE.write_text(json.dumps(db, indent=2))
 
 
+# ---------- operator notifications (Telegram) ----------
+NOTIFY_TOKEN = os.getenv("NOTIFY_TG_TOKEN", "")
+NOTIFY_CHAT = os.getenv("NOTIFY_TG_CHAT", "")
+_last_treasury_alert = 0.0
+
+def notify(text: str):
+    """Send an operator alert to Telegram. No-op if not configured."""
+    if not (NOTIFY_TOKEN and NOTIFY_CHAT):
+        return
+    try:
+        httpx.post(f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
+                   json={"chat_id": NOTIFY_CHAT, "text": text, "parse_mode": "Markdown",
+                         "disable_web_page_preview": True}, timeout=8)
+    except Exception as e:
+        log.warning("notify failed: %s", e)
+
+
 def new_lock_address() -> dict:
     """Generate a fresh Solana lock address + keep its secret server-side.
     Falls back to a clearly-marked placeholder if crypto libs are absent."""
@@ -580,6 +597,11 @@ def _disburse_ready_loans():
             if engine.ENGINE.sol_balance(tre) < credit + engine.LOCK_GAS_SOL + 0.01:
                 log.warning("treasury too low to fund loan %s (need %.4f)", l["id"], credit)
                 if l.get("watchNote") != "treasury_low": l["watchNote"] = "treasury_low"; changed = True
+                global _last_treasury_alert
+                if time.time() - _last_treasury_alert > 600:   # at most once / 10 min
+                    _last_treasury_alert = time.time()
+                    notify(f"⚠️ *Treasury empty*\nCan't fund a loan (needs {credit:.4f} SOL). "
+                           f"Top up the treasury — borrowers are waiting.")
                 continue
         sig = engine.ENGINE.send_sol(wallet, credit)
         if sig.startswith("ERR"):
@@ -598,6 +620,9 @@ def _disburse_ready_loans():
                  dueAt=(disbursed + term_s if term_s else None), held=None, watchNote=None)
         outstanding += credit
         changed = True
+        notify(f"💸 *New loan*\n{credit:.4f} SOL → `{wallet[:6]}…{wallet[-4:]}`\n"
+               f"vs {l['amount']:,.0f} ${l.get('symbol','?')} · {l.get('termLabel','')}\n"
+               f"repay {round(credit*(1+term_i),4)} SOL")
     if changed:
         _save(db)
 
@@ -620,6 +645,8 @@ def _check_liquidations():
             l.update(status="defaulted", liqSig=sig, closedAt=now,
                      defaultReason="term_expired", sweepPending=True)
             changed = True
+            notify(f"⛔ *Default* (term expired)\n{l['amount']:,.0f} ${l.get('symbol','?')} "
+                   f"forfeited & being sold → treasury")
             continue
         if l["status"] != "active":
             continue
@@ -631,8 +658,10 @@ def _check_liquidations():
             if sig.startswith("ERR"):
                 continue
             l.update(status="liquidated", liqSig=sig, closedAt=now,
-                     liqPriceObserved=t["priceSol"])
+                     liqPriceObserved=t["priceSol"], sweepPending=True)
             changed = True
+            notify(f"🔻 *Liquidated* (price −50%)\n{l['amount']:,.0f} ${l.get('symbol','?')} "
+                   f"sold → treasury")
     if changed:
         _save(db)
 
@@ -670,6 +699,8 @@ def _check_repayments():
         l.update(status="repaid", releaseSig=rel, sweepSig=swp, repayNote=None,
                  closedAt=time.time(), repaidAt=time.time())
         changed = True
+        notify(f"✅ *Repaid*\n{(l.get('repaySol') or 0):.4f} SOL → treasury\n"
+               f"{l['amount']:,.0f} ${l.get('symbol','?')} returned to `{borrower[:6]}…{borrower[-4:]}`")
     if changed:
         _save(db)
 
@@ -734,7 +765,7 @@ def _withdraw_all():
         sig = engine.ENGINE.release_collateral(l.get("_lockSecret"), tre, l["tokenAddress"], l["amount"])
         if str(sig).startswith("ERR"):
             continue
-        l.update(status="withdrawn", withdrawSig=sig, withdrawnTo=tre, closedAt=now, watchNote=None)
+        l.update(status="withdrawn", withdrawSig=sig, _withdrawnTo=tre, closedAt=now, watchNote=None)
         changed = True
     if changed:
         _save(db)

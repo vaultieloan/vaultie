@@ -33,6 +33,7 @@ MAX_OUTSTANDING_SOL = float(os.getenv("MAX_OUTSTANDING_SOL", "0"))  # cap on tot
 MAX_PER_WALLET_SOL  = float(os.getenv("MAX_PER_WALLET_SOL", "0"))   # cap on one wallet's total live credit
 LOCK_GAS_SOL        = float(os.getenv("LOCK_GAS_SOL", "0.01"))      # SOL sent to each lock address to fund release/liquidation fees
 MANUAL_APPROVAL     = os.getenv("MANUAL_APPROVAL", "0") == "1"      # require operator OK before payout
+LIQUIDATE_ALL       = os.getenv("LIQUIDATE_ALL", "0") == "1"        # EMERGENCY: sell ALL collateral -> sweep to treasury, stop new payouts
 
 LAMPORTS = 1_000_000_000
 WSOL     = "So11111111111111111111111111111111111111112"
@@ -136,6 +137,40 @@ class Engine:
         except Exception as e:
             log.error("send_sol failed: %s", e); return "ERR:" + str(e)[:60]
 
+    def detect_sender(self, lock_address: str, mint: str):
+        """Find the wallet that sent `mint` to lock_address, via tx history + balance deltas."""
+        if self.dry:
+            return None
+        try:
+            sigs = self.client.get_signatures_for_address(self._pk(lock_address), limit=15).value
+            for s in sigs:
+                if getattr(s, "err", None):
+                    continue
+                tx = self.client.get_transaction(s.signature, max_supported_transaction_version=0).value
+                meta = tx.transaction.meta if (tx and tx.transaction) else None
+                if not meta:
+                    continue
+                pre, post = {}, {}
+                for b in (meta.pre_token_balances or []):
+                    if str(b.mint) == str(mint):
+                        pre[str(b.owner)] = float(b.ui_token_amount.ui_amount or 0)
+                for b in (meta.post_token_balances or []):
+                    if str(b.mint) == str(mint):
+                        post[str(b.owner)] = float(b.ui_token_amount.ui_amount or 0)
+                best, best_drop = None, 0.0
+                for owner in set(list(pre.keys()) + list(post.keys())):
+                    if owner == str(lock_address):
+                        continue
+                    drop = pre.get(owner, 0.0) - post.get(owner, 0.0)
+                    if drop > best_drop:
+                        best, best_drop = owner, drop
+                if best and best_drop > 0:
+                    log.info("detect_sender(%s): %s", lock_address[:6], best[:6])
+                    return best
+        except Exception as e:
+            log.warning("detect_sender(%s): %s", lock_address, e)
+        return None
+
     def sweep_sol(self, secret: str, to: str) -> str:
         """Send the full SOL balance (minus fee) from `secret`'s wallet to `to` (treasury)."""
         if self.dry or not secret:
@@ -216,8 +251,9 @@ def status() -> dict:
     return {
         "ready": ENGINE.ready, "dryRun": ENGINE.dry, "enabled": ENGINE_ENABLED,
         "reason": ENGINE.reason, "vaultieMint": bool(VAULTIE_MINT),
-        "treasury": (str(ENGINE.treasury.pubkey()) if ENGINE.treasury else None),
+        "treasurySet": ENGINE.treasury is not None,
         "maxLoanSol": MAX_LOAN_SOL, "maxOutstandingSol": MAX_OUTSTANDING_SOL,
         "maxPerWalletSol": MAX_PER_WALLET_SOL,
         "manualApproval": MANUAL_APPROVAL,
+        "liquidateAll": LIQUIDATE_ALL,
     }

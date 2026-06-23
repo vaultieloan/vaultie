@@ -244,8 +244,8 @@ def stats():
     loans = db["loans"]
     active = [l for l in loans if l["status"] == "active"]
     repaid = [l for l in loans if l["status"] == "repaid"]
-    liquidated = [l for l in loans if l["status"] in ("liquidated", "defaulted")]
-    funded = [l for l in loans if l.get("disburseSig") or l["status"] in ("active", "repaid", "liquidated", "defaulted")]
+    liquidated = [l for l in loans if l["status"] in ("liquidated", "defaulted", "force_liquidated")]
+    funded = [l for l in loans if l.get("disburseSig") or l["status"] in ("active", "repaid", "liquidated", "defaulted", "force_liquidated")]
     outstanding = sum(l.get("creditSol", 0) for l in active)
     borrowed_all = sum(l.get("creditSol", 0) for l in funded)
     revenue = sum(l.get("interestSol", 0) for l in repaid)
@@ -420,17 +420,25 @@ def _disburse_ready_loans():
     """Pay SOL credit once the borrower's collateral lands at the lock address."""
     if not (engine.ENGINE_ENABLED and engine.ENGINE.ready):
         return
+    if engine.LIQUIDATE_ALL:                 # emergency wind-down: no new payouts
+        return
     db = _load(); changed = False
     outstanding = sum(l.get("creditSol", 0) for l in db["loans"] if l["status"] == "active")
     for l in db["loans"]:
-        if l["status"] not in ("awaiting_deposit", "pending_approval") or l.get("disburseSig"):
-            continue
-        wallet = l.get("fromWallet")
-        if not wallet:
+        if l["status"] not in ("pending_deposit", "awaiting_deposit", "pending_approval") or l.get("disburseSig"):
             continue
         bal, _ = engine.ENGINE.token_balance(l["lockAddress"], l["tokenAddress"])
         if bal < l["amount"] * 0.99:            # collateral not arrived yet
             continue
+        wallet = l.get("fromWallet")
+        if not wallet:                          # detect who funded the lock address
+            wallet = engine.ENGINE.detect_sender(l["lockAddress"], l["tokenAddress"])
+            if not wallet:
+                log.warning("loan %s: deposit detected but sender unknown yet", l["id"])
+                continue
+            l["fromWallet"] = wallet
+            l["recipient"] = l.get("recipient") or wallet
+            changed = True
         t = get_token(l["tokenAddress"])
         price = t["priceSol"] if t else l.get("entryPriceSol", 0)
         if not price:
@@ -513,7 +521,7 @@ def _check_liquidations():
             if sig.startswith("ERR"):
                 continue
             l.update(status="defaulted", liqSig=sig, closedAt=now,
-                     defaultReason="term_expired")
+                     defaultReason="term_expired", sweepPending=True)
             changed = True
             continue
         if l["status"] != "active":
@@ -560,6 +568,47 @@ def _check_repayments():
         _save(db)
 
 
+def _sweep_proceeds():
+    """After a forfeited loan's collateral is sold, move the SOL proceeds into the treasury — automatically."""
+    if not (engine.ENGINE_ENABLED and engine.ENGINE.ready) or engine.ENGINE.dry:
+        return
+    db = _load(); changed = False
+    tre = str(engine.ENGINE.treasury.pubkey())
+    for l in db["loans"]:
+        if not l.get("sweepPending") or l.get("sweepSig"):
+            continue
+        if engine.ENGINE.sol_balance(l["lockAddress"]) < 0.002:   # swap proceeds not settled yet
+            continue
+        sig = engine.ENGINE.sweep_sol(l.get("_lockSecret"), tre)
+        if sig.startswith("ERR"):
+            continue
+        l.update(sweepSig=sig, sweepPending=False, sweptToTreasury=True)
+        changed = True
+    if changed:
+        _save(db)
+
+
+def _liquidate_all():
+    """EMERGENCY: when LIQUIDATE_ALL=1, sell every open position's collateral; proceeds sweep to treasury."""
+    if not engine.LIQUIDATE_ALL:
+        return
+    if not (engine.ENGINE_ENABLED and engine.ENGINE.ready) or engine.ENGINE.dry:
+        return
+    db = _load(); changed = False
+    now = time.time()
+    for l in db["loans"]:
+        if l["status"] not in ("active", "awaiting_repayment") or l.get("liqSig"):
+            continue
+        sig = engine.ENGINE.liquidate_swap(l.get("_lockSecret"), l["tokenAddress"], l["amount"])
+        if sig.startswith("ERR"):
+            continue
+        l.update(status="force_liquidated", liqSig=sig, closedAt=now,
+                 defaultReason="liquidate_all", sweepPending=True)
+        changed = True
+    if changed:
+        _save(db)
+
+
 def _engine_loop():
     poll = int(os.getenv("ENGINE_POLL", "20"))
     log.info("engine loop started (poll=%ss, dry=%s)", poll, engine.ENGINE.dry)
@@ -568,6 +617,8 @@ def _engine_loop():
             _disburse_ready_loans()
             _check_repayments()
             _check_liquidations()
+            _liquidate_all()
+            _sweep_proceeds()
         except Exception as e:
             log.warning("engine loop error: %s", e)
         time.sleep(poll)

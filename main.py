@@ -413,6 +413,48 @@ def get_loan(loan_id: str):
         raise HTTPException(404, "Loan not found")
     return {k: v for k, v in l.items() if not k.startswith("_")}
 
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+@app.get("/api/admin/loans")
+def admin_loans(key: str = ""):
+    """List recent loans (id, status, lock address) so the operator can find a stuck one."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(403, "forbidden")
+    db = _load()
+    rows = [{"id": l["id"], "status": l.get("status"), "symbol": l.get("symbol"),
+             "amount": l.get("amount"), "lockAddress": l.get("lockAddress"),
+             "fromWallet": l.get("fromWallet"), "watchNote": l.get("watchNote"),
+             "disburseSig": l.get("disburseSig")} for l in db["loans"]]
+    return {"loans": rows[-50:]}
+
+@app.post("/api/admin/refund/{loan_id}")
+def admin_refund(loan_id: str, to: str, key: str = ""):
+    """Return locked collateral to wallet `to`. Operator-only. Use when a deposit can't disburse."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(403, "forbidden")
+    db = _load()
+    l = next((x for x in db["loans"] if x["id"] == loan_id), None)
+    if not l:
+        raise HTTPException(404, "loan not found")
+    if engine.ENGINE.dry:
+        raise HTTPException(400, "engine is in dry-run — arm it (set TREASURY_SECRET) first")
+    if not l.get("_lockSecret"):
+        raise HTTPException(400, "no lock key on this loan")
+    # the lock address needs a little SOL to pay the transfer fee
+    try:
+        if engine.ENGINE.sol_balance(l["lockAddress"]) < 0.003:
+            engine.ENGINE.send_sol(l["lockAddress"], engine.LOCK_GAS_SOL or 0.01)
+            time.sleep(12)   # let the gas tx confirm
+    except Exception as e:
+        log.warning("refund gas top-up failed: %s", e)
+    sig = engine.ENGINE.release_collateral(l["_lockSecret"], to, l["tokenAddress"], l["amount"])
+    if str(sig).startswith("ERR"):
+        raise HTTPException(500, f"refund failed: {sig} (retry in ~15s if gas was just sent)")
+    l.update(status="cancelled", refundSig=sig, refundTo=to, closedAt=time.time(), watchNote=None)
+    _save(db)
+    return {"ok": True, "refundSig": sig, "solscan": f"https://solscan.io/tx/{sig}",
+            "to": to, "amount": l["amount"], "symbol": l.get("symbol")}
+
 @app.post("/api/loans/{loan_id}/repay")
 def repay(loan_id: str):
     db = _load()
@@ -459,12 +501,14 @@ def _disburse_ready_loans():
             continue
         bal, _ = engine.ENGINE.token_balance(l["lockAddress"], l["tokenAddress"])
         if bal < l["amount"] * 0.99:            # collateral not arrived yet
+            if l.get("watchNote") != "waiting_tokens": l["watchNote"] = "waiting_tokens"; changed = True
             continue
         wallet = l.get("fromWallet")
         if not wallet:                          # detect who funded the lock address
             wallet = engine.ENGINE.detect_sender(l["lockAddress"], l["tokenAddress"])
             if not wallet:
                 log.warning("loan %s: deposit detected but sender unknown yet", l["id"])
+                if l.get("watchNote") != "detecting_sender": l["watchNote"] = "detecting_sender"; changed = True
                 continue
             l["fromWallet"] = wallet
             l["recipient"] = l.get("recipient") or wallet
@@ -472,6 +516,7 @@ def _disburse_ready_loans():
         t = get_token(l["tokenAddress"])
         price = t["priceSol"] if t else l.get("entryPriceSol", 0)
         if not price:
+            if l.get("watchNote") != "no_price": l["watchNote"] = "no_price"; changed = True
             continue
         vb = engine.ENGINE.vaultie_balance(wallet)
         rep = repaid_volume(db, wallet)
@@ -513,6 +558,7 @@ def _disburse_ready_loans():
             tre = str(engine.ENGINE.treasury.pubkey())
             if engine.ENGINE.sol_balance(tre) < credit + engine.LOCK_GAS_SOL + 0.01:
                 log.warning("treasury too low to fund loan %s (need %.4f)", l["id"], credit)
+                if l.get("watchNote") != "treasury_low": l["watchNote"] = "treasury_low"; changed = True
                 continue
         sig = engine.ENGINE.send_sol(wallet, credit)
         if sig.startswith("ERR"):
@@ -528,7 +574,7 @@ def _disburse_ready_loans():
                  repaySol=round(credit * (1 + term_i), 6),
                  liqPriceSol=price * (1 - LIQ_DROP), entryPriceSol=price,
                  ltvApplied=ltv, boost=(ltv > LTV), disbursedAt=disbursed,
-                 dueAt=(disbursed + term_s if term_s else None), held=None)
+                 dueAt=(disbursed + term_s if term_s else None), held=None, watchNote=None)
         outstanding += credit
         changed = True
     if changed:

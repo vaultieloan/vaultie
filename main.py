@@ -649,16 +649,25 @@ def _check_repayments():
         addr = l.get("repayAddress"); need = l.get("repaySol") or 0
         if not addr or need <= 0:
             continue
-        if engine.ENGINE.sol_balance(addr) < need * 0.999:   # not paid yet
+        bal = engine.ENGINE.sol_balance(addr)
+        if bal < need * 0.999:   # not fully paid yet
+            note = f"received {bal:.4f} / need {need:.4f} SOL"
+            if l.get("repayNote") != note: l["repayNote"] = note; changed = True
             continue
         borrower = l.get("fromWallet") or l.get("recipient")
         if not borrower:
             continue
+        # repayment received — ensure the lock address has gas to pay the release fee
+        if engine.ENGINE.sol_balance(l["lockAddress"]) < 0.003:
+            engine.ENGINE.send_sol(l["lockAddress"], engine.LOCK_GAS_SOL or 0.01)
+            if l.get("repayNote") != "funding_gas": l["repayNote"] = "funding_gas"; changed = True
+            continue   # release on the next pass once gas confirms
         rel = engine.ENGINE.release_collateral(l.get("_lockSecret"), borrower, l["tokenAddress"], l["amount"])
         if rel.startswith("ERR"):
+            if l.get("repayNote") != "release_retry": l["repayNote"] = "release_retry:" + rel[:30]; changed = True
             continue
         swp = engine.ENGINE.sweep_sol(l.get("_repaySecret"), tre)   # move repayment into treasury
-        l.update(status="repaid", releaseSig=rel, sweepSig=swp,
+        l.update(status="repaid", releaseSig=rel, sweepSig=swp, repayNote=None,
                  closedAt=time.time(), repaidAt=time.time())
         changed = True
     if changed:

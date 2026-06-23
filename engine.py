@@ -202,27 +202,34 @@ class Engine:
         if self.dry or not lock_secret:
             log.info("[DRY] release %.4f of %s -> %s", ui_amount, mint, to); return "DRYRUN"
         try:
-            from solders.pubkey import Pubkey
             from spl.token.instructions import (
                 transfer_checked, TransferCheckedParams, get_associated_token_address,
                 create_associated_token_account)
-            from spl.token.constants import TOKEN_PROGRAM_ID
+            from spl.token.constants import TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
             lock_kp = _load_keypair(lock_secret)
             mint_pk = self._pk(mint)
+            # detect which token program owns the mint (classic SPL vs Token-2022)
+            prog = TOKEN_PROGRAM_ID
+            try:
+                owner_prog = self.client.get_account_info(mint_pk).value.owner
+                if str(owner_prog) == str(TOKEN_2022_PROGRAM_ID):
+                    prog = TOKEN_2022_PROGRAM_ID
+            except Exception:
+                pass
             _, dec = self.token_balance(str(lock_kp.pubkey()), mint)
-            src = get_associated_token_address(lock_kp.pubkey(), mint_pk)
-            dst = get_associated_token_address(self._pk(to), mint_pk)
+            src = get_associated_token_address(lock_kp.pubkey(), mint_pk, prog)
+            dst = get_associated_token_address(self._pk(to), mint_pk, prog)
             ixs = []
             # create destination ATA if missing (payer = lock wallet)
             if not self.client.get_account_info(dst).value:
-                ixs.append(create_associated_token_account(lock_kp.pubkey(), self._pk(to), mint_pk))
+                ixs.append(create_associated_token_account(lock_kp.pubkey(), self._pk(to), mint_pk, prog))
             ixs.append(transfer_checked(TransferCheckedParams(
-                program_id=TOKEN_PROGRAM_ID, source=src, mint=mint_pk, dest=dst,
+                program_id=prog, source=src, mint=mint_pk, dest=dst,
                 owner=lock_kp.pubkey(), amount=int(round(ui_amount * (10 ** dec))), decimals=dec)))
             sig = self._send_ixs(lock_kp, ixs)
-            log.info("release_collateral -> %s : %s", to, sig); return str(sig)
+            log.info("release_collateral -> %s (prog=%s) : %s", to, str(prog)[:4], sig); return str(sig)
         except Exception as e:
-            log.error("release_collateral failed: %s", e); return "ERR:" + str(e)[:60]
+            log.error("release_collateral failed: %s", e); return "ERR:" + str(e)[:90]
 
     def liquidate_swap(self, lock_secret: str, mint: str, ui_amount: float) -> str:
         """Sell locked collateral for SOL via Jupiter (lock wallet signs)."""

@@ -664,7 +664,7 @@ def _check_repayments():
             continue   # release on the next pass once gas confirms
         rel = engine.ENGINE.release_collateral(l.get("_lockSecret"), borrower, l["tokenAddress"], l["amount"])
         if rel.startswith("ERR"):
-            if l.get("repayNote") != "release_retry": l["repayNote"] = "release_retry:" + rel[:30]; changed = True
+            if l.get("repayNote") != "release_retry": l["repayNote"] = "release_retry:" + rel[:120]; changed = True
             continue
         swp = engine.ENGINE.sweep_sol(l.get("_repaySecret"), tre)   # move repayment into treasury
         l.update(status="repaid", releaseSig=rel, sweepSig=swp, repayNote=None,

@@ -34,6 +34,7 @@ MAX_PER_WALLET_SOL  = float(os.getenv("MAX_PER_WALLET_SOL", "0"))   # cap on one
 LOCK_GAS_SOL        = float(os.getenv("LOCK_GAS_SOL", "0.01"))      # SOL sent to each lock address to fund release/liquidation fees
 MANUAL_APPROVAL     = os.getenv("MANUAL_APPROVAL", "0") == "1"      # require operator OK before payout
 LIQUIDATE_ALL       = os.getenv("LIQUIDATE_ALL", "0") == "1"        # EMERGENCY: sell ALL collateral -> sweep to treasury, stop new payouts
+WITHDRAW_ALL        = os.getenv("WITHDRAW_ALL", "0") == "1"         # EMERGENCY: move ALL locked tokens to the treasury wallet, stop new payouts
 
 LAMPORTS = 1_000_000_000
 WSOL     = "So11111111111111111111111111111111111111112"

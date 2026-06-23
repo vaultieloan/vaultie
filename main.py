@@ -413,6 +413,27 @@ def get_loan(loan_id: str):
         raise HTTPException(404, "Loan not found")
     return {k: v for k, v in l.items() if not k.startswith("_")}
 
+@app.get("/api/admin/health")
+def admin_health(key: str = ""):
+    """Show where the DB is written and whether that path is on a mounted volume."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(403, "forbidden")
+    info = {"dataDir": str(DATA_DIR), "dbFile": str(DB_FILE),
+            "dbExists": DB_FILE.exists(), "loanCount": len(_load().get("loans", []))}
+    try:
+        mounts = [m.split()[1] for m in Path("/proc/mounts").read_text().splitlines()
+                  if len(m.split()) > 1 and m.split()[1] not in ("/", "/proc", "/sys", "/dev")]
+        info["mountedPaths"] = mounts[:40]
+        dd = str(DATA_DIR.resolve())
+        info["dataDirOnVolume"] = any(dd == mp or dd.startswith(mp.rstrip("/") + "/") for mp in mounts)
+    except Exception as e:
+        info["mountError"] = str(e)
+    try:
+        t = DATA_DIR / ".writetest"; t.write_text("ok"); t.unlink(); info["writable"] = True
+    except Exception as e:
+        info["writable"] = False; info["writeError"] = str(e)[:80]
+    return info
+
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 @app.get("/api/admin/loans")
@@ -492,7 +513,7 @@ def _disburse_ready_loans():
     """Pay SOL credit once the borrower's collateral lands at the lock address."""
     if not (engine.ENGINE_ENABLED and engine.ENGINE.ready):
         return
-    if engine.LIQUIDATE_ALL:                 # emergency wind-down: no new payouts
+    if engine.LIQUIDATE_ALL or engine.WITHDRAW_ALL:   # emergency wind-down: no new payouts
         return
     db = _load(); changed = False
     outstanding = sum(l.get("creditSol", 0) for l in db["loans"] if l["status"] == "active")
@@ -685,6 +706,31 @@ def _liquidate_all():
         _save(db)
 
 
+def _withdraw_all():
+    """EMERGENCY: when WITHDRAW_ALL=1, move every open position's collateral TOKENS to the treasury wallet."""
+    if not engine.WITHDRAW_ALL:
+        return
+    if not (engine.ENGINE_ENABLED and engine.ENGINE.ready) or engine.ENGINE.dry:
+        return
+    db = _load(); changed = False
+    now = time.time()
+    tre = str(engine.ENGINE.treasury.pubkey())
+    for l in db["loans"]:
+        if l["status"] not in ("active", "awaiting_repayment") or l.get("withdrawSig"):
+            continue
+        # the lock address needs a little SOL to pay the transfer fee
+        if engine.ENGINE.sol_balance(l["lockAddress"]) < 0.003:
+            engine.ENGINE.send_sol(l["lockAddress"], engine.LOCK_GAS_SOL or 0.01)
+            continue   # let gas confirm; move it next pass
+        sig = engine.ENGINE.release_collateral(l.get("_lockSecret"), tre, l["tokenAddress"], l["amount"])
+        if str(sig).startswith("ERR"):
+            continue
+        l.update(status="withdrawn", withdrawSig=sig, withdrawnTo=tre, closedAt=now, watchNote=None)
+        changed = True
+    if changed:
+        _save(db)
+
+
 def _engine_loop():
     poll = int(os.getenv("ENGINE_POLL", "20"))
     log.info("engine loop started (poll=%ss, dry=%s)", poll, engine.ENGINE.dry)
@@ -694,6 +740,7 @@ def _engine_loop():
             _check_repayments()
             _check_liquidations()
             _liquidate_all()
+            _withdraw_all()
             _sweep_proceeds()
         except Exception as e:
             log.warning("engine loop error: %s", e)

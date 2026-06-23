@@ -120,6 +120,15 @@ class Engine:
         return self.token_balance(owner, VAULTIE_MINT)[0]
 
     # ---------- writes ----------
+    def _send_ixs(self, payer_kp, ixs):
+        """Compile + send a list of instructions as a versioned tx signed by payer_kp."""
+        from solders.message import MessageV0
+        from solders.transaction import VersionedTransaction
+        bh = self.client.get_latest_blockhash().value.blockhash
+        msg = MessageV0.try_compile(payer_kp.pubkey(), ixs, [], bh)
+        tx = VersionedTransaction(msg, [payer_kp])
+        return self.client.send_raw_transaction(bytes(tx)).value
+
     def send_sol(self, to: str, sol: float) -> str:
         """Pay `sol` from treasury to `to`. Returns tx signature or 'DRYRUN'/'ERR'."""
         lamports = int(round(sol * LAMPORTS))
@@ -127,11 +136,9 @@ class Engine:
             log.info("[DRY] send_sol -> %s : %.6f SOL", to, sol); return "DRYRUN"
         try:
             from solders.system_program import transfer, TransferParams
-            from solana.transaction import Transaction
-            tx = Transaction().add(transfer(TransferParams(
-                from_pubkey=self.treasury.pubkey(),
-                to_pubkey=self._pk(to), lamports=lamports)))
-            sig = self.client.send_transaction(tx, self.treasury).value
+            ix = transfer(TransferParams(
+                from_pubkey=self.treasury.pubkey(), to_pubkey=self._pk(to), lamports=lamports))
+            sig = self._send_ixs(self.treasury, [ix])
             log.info("send_sol -> %s : %.6f SOL : %s", to, sol, sig)
             return str(sig)
         except Exception as e:
@@ -177,14 +184,13 @@ class Engine:
             log.info("[DRY] sweep -> %s", to); return "DRYRUN"
         try:
             from solders.system_program import transfer, TransferParams
-            from solana.transaction import Transaction
             kp = _load_keypair(secret)
             lamports = int(round(self.sol_balance(str(kp.pubkey())) * LAMPORTS)) - 5000
             if lamports <= 0:
                 return "ERR:empty"
-            tx = Transaction().add(transfer(TransferParams(
-                from_pubkey=kp.pubkey(), to_pubkey=self._pk(to), lamports=lamports)))
-            sig = self.client.send_transaction(tx, kp).value
+            ix = transfer(TransferParams(
+                from_pubkey=kp.pubkey(), to_pubkey=self._pk(to), lamports=lamports))
+            sig = self._send_ixs(kp, [ix])
             log.info("sweep -> %s : %d lamports : %s", to, lamports, sig); return str(sig)
         except Exception as e:
             log.error("sweep failed: %s", e); return "ERR:" + str(e)[:60]
@@ -200,20 +206,19 @@ class Engine:
                 transfer_checked, TransferCheckedParams, get_associated_token_address,
                 create_associated_token_account)
             from spl.token.constants import TOKEN_PROGRAM_ID
-            from solana.transaction import Transaction
             lock_kp = _load_keypair(lock_secret)
             mint_pk = self._pk(mint)
             _, dec = self.token_balance(str(lock_kp.pubkey()), mint)
             src = get_associated_token_address(lock_kp.pubkey(), mint_pk)
             dst = get_associated_token_address(self._pk(to), mint_pk)
-            tx = Transaction()
+            ixs = []
             # create destination ATA if missing (payer = lock wallet)
             if not self.client.get_account_info(dst).value:
-                tx.add(create_associated_token_account(lock_kp.pubkey(), self._pk(to), mint_pk))
-            tx.add(transfer_checked(TransferCheckedParams(
+                ixs.append(create_associated_token_account(lock_kp.pubkey(), self._pk(to), mint_pk))
+            ixs.append(transfer_checked(TransferCheckedParams(
                 program_id=TOKEN_PROGRAM_ID, source=src, mint=mint_pk, dest=dst,
                 owner=lock_kp.pubkey(), amount=int(round(ui_amount * (10 ** dec))), decimals=dec)))
-            sig = self.client.send_transaction(tx, lock_kp).value
+            sig = self._send_ixs(lock_kp, ixs)
             log.info("release_collateral -> %s : %s", to, sig); return str(sig)
         except Exception as e:
             log.error("release_collateral failed: %s", e); return "ERR:" + str(e)[:60]

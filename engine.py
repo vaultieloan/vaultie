@@ -252,8 +252,5 @@ def status() -> dict:
         "ready": ENGINE.ready, "dryRun": ENGINE.dry, "enabled": ENGINE_ENABLED,
         "reason": ENGINE.reason, "vaultieMint": bool(VAULTIE_MINT),
         "treasurySet": ENGINE.treasury is not None,
-        "maxLoanSol": MAX_LOAN_SOL, "maxOutstandingSol": MAX_OUTSTANDING_SOL,
-        "maxPerWalletSol": MAX_PER_WALLET_SOL,
         "manualApproval": MANUAL_APPROVAL,
-        "liquidateAll": LIQUIDATE_ALL,
     }

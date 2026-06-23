@@ -238,6 +238,27 @@ class StakeIn(BaseModel):
 
 
 # ---------- routes ----------
+@app.get("/api/protocol/locked")
+def locked():
+    """Currently-locked collateral, aggregated per token. Real locks only (collateral present)."""
+    db = _load()
+    agg = {}
+    for l in db["loans"]:
+        if l["status"] not in ("active", "awaiting_repayment"):
+            continue
+        a = l["tokenAddress"]
+        if a not in agg:
+            agg[a] = {"symbol": l.get("symbol", "?"), "tokenAddress": a,
+                      "amount": 0.0, "positions": 0, "creditSol": 0.0}
+        agg[a]["amount"] += l.get("amount", 0) or 0
+        agg[a]["positions"] += 1
+        agg[a]["creditSol"] += l.get("creditSol", 0) or 0
+    out = sorted(agg.values(), key=lambda x: -x["creditSol"])
+    return {"locked": [{"symbol": x["symbol"], "tokenAddress": x["tokenAddress"],
+                        "amount": round(x["amount"], 4), "positions": x["positions"],
+                        "creditSol": round(x["creditSol"], 6)} for x in out]}
+
+
 @app.get("/api/protocol/stats")
 def stats():
     db = _load()
@@ -246,15 +267,16 @@ def stats():
     repaid = [l for l in loans if l["status"] == "repaid"]
     liquidated = [l for l in loans if l["status"] in ("liquidated", "defaulted", "force_liquidated")]
     funded = [l for l in loans if l.get("disburseSig") or l["status"] in ("active", "repaid", "liquidated", "defaulted", "force_liquidated")]
+    locked = [l for l in loans if l["status"] in ("active", "awaiting_repayment")]
     outstanding = sum(l.get("creditSol", 0) for l in active)
     borrowed_all = sum(l.get("creditSol", 0) for l in funded)
     revenue = sum(l.get("interestSol", 0) for l in repaid)
-    liquidity = sum(x["amount"] for x in db["lp"])
-    util = min(outstanding / liquidity, 0.95) if liquidity else 0
+    # TVL = real SOL value of collateral currently locked (loans where SOL was actually drawn)
+    locked_value = sum((l.get("amount", 0) or 0) * (l.get("entryPriceSol", 0) or 0) for l in locked)
     wallets = {l.get("fromWallet") or l.get("recipient") for l in loans}
     wallets.discard(None)
     return {
-        "liquiditySol": round(liquidity, 2),
+        "liquiditySol": round(locked_value, 2),
         "creditOutstandingSol": round(outstanding, 2),
         "borrowedAllTimeSol": round(borrowed_all, 3),
         "revenueSol": round(revenue, 4),
@@ -264,8 +286,8 @@ def stats():
         "liquidations": len(liquidated),
         "tokensCount": len({l["tokenAddress"] for l in funded}),
         "users": len(wallets),
-        "utilization": round(util, 4),
-        "lpApr": round(util * 0.40, 4),     # 0 at launch; rises with real utilization
+        "utilization": 0,
+        "lpApr": 0,     # SOL supply not live yet
     }
 
 @app.get("/api/tokens")
@@ -382,6 +404,14 @@ def confirm_deposit(loan_id: str, body: ConfirmIn = ConfirmIn()):
     loan["confirmedAt"] = time.time()
     _save(db)
     return {"id": loan_id, "status": loan["status"], "lockAddress": loan["lockAddress"]}
+
+@app.get("/api/loans/{loan_id}")
+def get_loan(loan_id: str):
+    db = _load()
+    l = next((x for x in db["loans"] if x["id"] == loan_id), None)
+    if not l:
+        raise HTTPException(404, "Loan not found")
+    return {k: v for k, v in l.items() if not k.startswith("_")}
 
 @app.post("/api/loans/{loan_id}/repay")
 def repay(loan_id: str):

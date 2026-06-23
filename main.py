@@ -105,10 +105,13 @@ def notify(text: str):
     """Send an operator alert to Telegram. No-op if not configured."""
     if not (NOTIFY_TOKEN and NOTIFY_CHAT):
         return
+    url = f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage"
     try:
-        httpx.post(f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
-                   json={"chat_id": NOTIFY_CHAT, "text": text, "parse_mode": "Markdown",
-                         "disable_web_page_preview": True}, timeout=8)
+        r = httpx.post(url, json={"chat_id": NOTIFY_CHAT, "text": text, "parse_mode": "Markdown",
+                                  "disable_web_page_preview": True}, timeout=8)
+        if r.status_code >= 400:      # markdown failed to parse -> resend as plain text
+            httpx.post(url, json={"chat_id": NOTIFY_CHAT, "text": text,
+                                  "disable_web_page_preview": True}, timeout=8)
     except Exception as e:
         log.warning("notify failed: %s", e)
 
@@ -535,7 +538,7 @@ def _disburse_ready_loans():
     db = _load(); changed = False
     outstanding = sum(l.get("creditSol", 0) for l in db["loans"] if l["status"] == "active")
     for l in db["loans"]:
-        if l["status"] not in ("pending_deposit", "awaiting_deposit", "pending_approval") or l.get("disburseSig"):
+        if l["status"] not in ("pending_deposit", "awaiting_deposit", "pending_approval", "held") or l.get("disburseSig"):
             continue
         bal, _ = engine.ENGINE.token_balance(l["lockAddress"], l["tokenAddress"])
         if bal < l["amount"] * 0.99:            # collateral not arrived yet

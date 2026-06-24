@@ -140,6 +140,30 @@ DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = float(os.getenv("PRICE_TTL", "30"))
 
+WSOL = "So11111111111111111111111111111111111111112"
+_SOL_USD_CACHE = {"t": 0.0, "v": 0.0}
+
+def _live_sol_usd() -> float:
+    """Live SOL/USD from Dexscreener (cached 60s). Falls back to env SOL_USD."""
+    if (time.time() - _SOL_USD_CACHE["t"]) < 60 and _SOL_USD_CACHE["v"] > 0:
+        return _SOL_USD_CACHE["v"]
+    try:
+        import httpx
+        r = httpx.get(DEX_URL + WSOL, timeout=4.0, headers={"User-Agent": "vaultie/0.1"})
+        r.raise_for_status()
+        pairs = [p for p in (r.json().get("pairs") or []) if p.get("chainId") == "solana"]
+        cand = [p for p in pairs
+                if (p.get("baseToken") or {}).get("address") == WSOL and float(p.get("priceUsd") or 0) > 0]
+        if cand:
+            p = max(cand, key=lambda x: (x.get("liquidity") or {}).get("usd") or 0)
+            v = float(p["priceUsd"])
+            if 10 < v < 10000:                 # sanity band
+                _SOL_USD_CACHE.update(t=time.time(), v=v)
+                return v
+    except Exception:
+        pass
+    return SOL_USD
+
 
 def _parse_dex(payload: dict, address: str) -> Optional[dict]:
     pairs = [p for p in (payload.get("pairs") or []) if p.get("chainId") == "solana"]
@@ -148,9 +172,11 @@ def _parse_dex(payload: dict, address: str) -> Optional[dict]:
     # pick the deepest pool
     p = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd") or 0)
     price_usd = float(p.get("priceUsd") or 0)
-    price_sol = float(p.get("priceNative") or 0)          # token price denominated in SOL
+    price_native = float(p.get("priceNative") or 0)      # in the pool's QUOTE token (not always SOL!)
     liq_usd = float((p.get("liquidity") or {}).get("usd") or 0)
-    sol_usd = (price_usd / price_sol) if price_sol else SOL_USD
+    # Always derive the SOL price from USD so USDC/USDT-quoted pools aren't read as SOL.
+    sol_usd = _live_sol_usd()
+    price_sol = (price_usd / sol_usd) if (price_usd and sol_usd) else 0.0
     base = p.get("baseToken") or {}
     return {
         "symbol": base.get("symbol") or address[:4].upper(),
@@ -158,6 +184,7 @@ def _parse_dex(payload: dict, address: str) -> Optional[dict]:
         "address": address,
         "priceUsd": price_usd,
         "priceSol": price_sol,
+        "priceNative": price_native,
         "liquidityUsd": liq_usd,
         "liquiditySol": (liq_usd / sol_usd) if sol_usd else 0,
         "solUsd": sol_usd,
@@ -466,7 +493,34 @@ def admin_loans(key: str = ""):
              "amount": l.get("amount"), "lockAddress": l.get("lockAddress"),
              "fromWallet": l.get("fromWallet"), "watchNote": l.get("watchNote"),
              "disburseSig": l.get("disburseSig")} for l in db["loans"]]
-    return {"loans": rows[-50:]}
+    return {"loans": rows[::-1][:200], "total": len(rows)}
+
+@app.get("/api/admin/deposits")
+def admin_deposits(key: str = ""):
+    """Read the LIVE on-chain token balance on each unpaid loan's lock address,
+    so the operator can see which deposits actually arrived but never paid out."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(403, "forbidden")
+    db = _load()
+    unpaid = ("awaiting_deposit", "pending_deposit", "pending_approval", "held")
+    rows = []
+    for l in db["loans"]:
+        if l.get("status") not in unpaid or l.get("disburseSig"):
+            continue
+        bal = -1.0
+        try:
+            bal, _ = engine.ENGINE.token_balance(l["lockAddress"], l["tokenAddress"])
+        except Exception:
+            bal = -1.0
+        need = float(l.get("amount") or 0)
+        rows.append({
+            "id": l["id"], "symbol": l.get("symbol"), "status": l.get("status"),
+            "needed": need, "onchain": bal,
+            "hasTokens": (bal >= need * 0.99 and need > 0),
+            "lockAddress": l.get("lockAddress"), "fromWallet": l.get("fromWallet"),
+        })
+    rows.sort(key=lambda r: (not r["hasTokens"]))
+    return {"deposits": rows, "withTokens": sum(1 for r in rows if r["hasTokens"]), "scanned": len(rows)}
 
 @app.post("/api/admin/refund/{loan_id}")
 def admin_refund(loan_id: str, to: str, key: str = ""):

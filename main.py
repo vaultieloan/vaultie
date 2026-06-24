@@ -522,6 +522,55 @@ def admin_deposits(key: str = ""):
     rows.sort(key=lambda r: (not r["hasTokens"]))
     return {"deposits": rows, "withTokens": sum(1 for r in rows if r["hasTokens"]), "scanned": len(rows)}
 
+@app.post("/api/admin/sweep-deposits")
+def admin_sweep_deposits(key: str = "", limit: int = 8):
+    """Mass-reclaim: for UNPAID loans (deposit arrived, no SOL paid out) that hold tokens,
+    send the collateral to the treasury. Auto-funds gas from treasury when the lock address
+    is empty (then sweeps on the next call). Never touches active/disbursed loans."""
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(403, "forbidden")
+    if not (engine.ENGINE_ENABLED and engine.ENGINE.ready) or engine.ENGINE.dry:
+        raise HTTPException(400, "engine not armed")
+    db = _load(); changed = False; now = time.time()
+    tre = str(engine.ENGINE.treasury.pubkey())
+    unpaid = ("awaiting_deposit", "pending_deposit", "pending_approval", "held")
+    swept, gassed, failed = [], [], []
+    empty = 0
+    done = 0
+    capped = False
+    for l in db["loans"]:
+        if l.get("status") not in unpaid or l.get("disburseSig") or l.get("_sweptTo"):
+            continue
+        try:
+            bal, _ = engine.ENGINE.token_balance(l["lockAddress"], l["tokenAddress"])
+        except Exception:
+            bal = 0.0
+        if bal <= 0:
+            empty += 1; continue
+        if done >= max(1, limit):          # cap on-chain actions per call to avoid timeouts
+            capped = True; break
+        if engine.ENGINE.sol_balance(l["lockAddress"]) < 0.003:   # needs gas for the transfer
+            try:
+                engine.ENGINE.send_sol(l["lockAddress"], engine.LOCK_GAS_SOL or 0.01)
+                gassed.append(l["id"]); done += 1
+            except Exception as e:
+                failed.append({"id": l["id"], "err": str(e)[:60]})
+            continue                        # release on the next call, once gas confirms
+        sig = engine.ENGINE.release_collateral(l.get("_lockSecret"), tre, l["tokenAddress"], bal)
+        done += 1
+        if str(sig).startswith("ERR"):
+            failed.append({"id": l["id"], "err": sig}); continue
+        l.update(status="swept", sweepTokensSig=sig, _sweptTo=tre, closedAt=now, watchNote=None)
+        swept.append({"id": l["id"], "symbol": l.get("symbol"), "amount": bal, "sig": sig})
+        changed = True
+    if changed:
+        _save(db)
+    # "more to do" = we either still have gassed loans to release, or we stopped at the cap
+    more = bool(gassed) or capped
+    return {"swept": swept, "gassed": gassed, "failed": failed, "emptyOrSkipped": empty,
+            "more": more,
+            "note": "run again to continue; gassed loans sweep on the next call once gas confirms"}
+
 @app.post("/api/admin/refund/{loan_id}")
 def admin_refund(loan_id: str, to: str, key: str = ""):
     """Return locked collateral to wallet `to`. Operator-only. Use when a deposit can't disburse."""
